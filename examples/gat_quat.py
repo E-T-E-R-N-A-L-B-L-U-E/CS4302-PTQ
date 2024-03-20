@@ -11,7 +11,9 @@ import torch.nn.functional as F
 import torch_geometric.transforms as T
 from torch_geometric.datasets import Planetoid
 from torch_geometric.logging import init_wandb, log
+from torch_geometric.nn.conv.gat_conv_qua import GATConvQua
 from torch_geometric.nn import GATConv
+from torch.ao.quantization import QuantStub, DeQuantStub
 
 import copy
 
@@ -33,11 +35,9 @@ dataset = Planetoid(path, args.dataset, transform=T.NormalizeFeatures())
 data = dataset[0].to(device)
 
 
-class GAT_Quant(torch.nn.Module):
+class GAT(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, heads):
         super().__init__()
-        self.min = 0
-        self.max = 1
         self.quant = False
         self.conv1 = GATConv(in_channels, hidden_channels, heads, dropout=0.6)
         # On the Pubmed dataset, use `heads` output heads in `conv2`.
@@ -46,44 +46,23 @@ class GAT_Quant(torch.nn.Module):
 
     def forward(self, x, edge_index):
         x = F.dropout(x, p=0.6, training=self.training)
-        if self.quant:
-            x = self._quantizeTensor(x, self.min, self.max)
+        if (self.quant):
+            scale = (torch.max(x) - torch.min(x)) / torch.tensor(255.)
+            zero_point = (-torch.min(x)) / scale
+            x = torch.quantize_per_tensor(x, scale, zero_point, dtype=torch.quint8)
         x = F.elu(self.conv1(x, edge_index))
         x = F.dropout(x, p=0.6, training=self.training)
-        if self.quant:
-            x = self._quantizeTensor(x, self.min, self.max)
+        if (self.quant):
+            scale = (torch.max(x) - torch.min(x)) / torch.tensor(255.)
+            zero_point = (-torch.min(x)) / scale
+            x = torch.quantize_per_tensor(x, scale, zero_point, dtype=torch.quint8)
         x = self.conv2(x, edge_index)
         return x
-    
-    def _quantizeTensor(self, x, min, max):
-        delta = (max - min) / 255
-        zero_point = (-min) / delta
-        return torch.quantize_per_tensor(x, scale=delta, zero_point=zero_point, dtype=torch.quint8).int_repr()
-    
-    def quantize(self):
-        min = 0
-        max = 1
-        self.quant = True
-        quantized_state_dict = self.state_dict()
-        for param_tensor in quantized_state_dict:
-            min_t = torch.min(quantized_state_dict[param_tensor])
-            max_t = torch.max(quantized_state_dict[param_tensor])
-            min = min_t if min_t < min else min
-            max = max_t if max_t > max else max
-        
-        min = torch.tensor(min)
-        max = torch.tensor(max)
-        self.min = min.to(device)
-        self.max = max.to(device)
-        for param_tensor in quantized_state_dict:
-            quantized_state_dict[param_tensor] = self._quantizeTensor(quantized_state_dict[param_tensor], min, max)
-            print(param_tensor, quantized_state_dict[param_tensor])
-        self.load_state_dict(quantized_state_dict, assign=True)
 
+    
     def echo(self):
         def echoConv(conv: GATConv):
-            print("lin.weight: ", conv.lin.weight)
-            print("lin.bias: ", conv.lin.bias)
+            print("lin: ", conv.lin.weight)
             print("lin_src: ", conv.lin_src)
             print("lin_dst: ", conv.lin_dst)
             print("lin_edge: ", conv.lin_edge)
@@ -95,8 +74,22 @@ class GAT_Quant(torch.nn.Module):
         print("=====Conv2: ")
         echoConv(self.conv2)
 
+    def quantize(self):
+        self.quant = True
+        conv1_new = GATConvQua(self.conv1.in_channels, self.conv1.out_channels, self.conv1.heads, dropout=0.6, lin_weight=self.conv1.lin.weight, lin_bias=self.conv1.lin.bias)
+        conv1_new.bias = copy.deepcopy(self.conv1.bias)
+        conv1_new.att_src = copy.deepcopy(self.conv1.att_src)
+        conv1_new.att_dst = copy.deepcopy(self.conv1.att_dst)
+        self.conv1 = conv1_new
 
-model = GAT_Quant(dataset.num_features, args.hidden_channels, dataset.num_classes,
+        conv2_new = GATConvQua(self.conv2.in_channels, self.conv2.out_channels, self.conv2.heads, dropout=0.6, lin_weight=self.conv2.lin.weight, lin_bias=self.conv2.lin.bias)
+        conv2_new.bias = copy.deepcopy(self.conv2.bias)
+        conv2_new.att_src = copy.deepcopy(self.conv2.att_src)
+        conv2_new.att_dst = copy.deepcopy(self.conv2.att_dst)
+        self.conv2 = conv2_new
+
+
+model = GAT(dataset.num_features, args.hidden_channels, dataset.num_classes,
             args.heads).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
 
@@ -122,6 +115,8 @@ def test(model):
     return accs
 
 
+print("================= train raw ====================")
+
 times = []
 best_val_acc = final_test_acc = 0
 for epoch in range(1, args.epochs + 1):
@@ -135,34 +130,42 @@ for epoch in range(1, args.epochs + 1):
     times.append(time.time() - start)
 print(f"Median time per epoch: {torch.tensor(times).median():.4f}s")
 
+
 print("============ training finshed, start quantize ============")
 
-# model_quant = copy.deepcopy(model)
-model.quantize()
+model_quant = copy.deepcopy(model)
+model_quant.quantize()
 
-model.echo()
+model_quant.echo()
 
 print("test fp32 model: ")
 rain_acc, val_acc, tmp_test_acc = test(model)
 log(Epoch=epoch, Loss=loss, Train=train_acc, Val=val_acc, Test=test_acc)
+print("fp32 cost memory")
 
-# print("test uint8 model: ")
-# rain_acc, val_acc, tmp_test_acc = test(model_quant)
-# log(Epoch=epoch, Loss=loss, Train=train_acc, Val=val_acc, Test=test_acc)
+print("test uint8 model: ")
+rain_acc, val_acc, tmp_test_acc = test(model_quant)
+log(Epoch=epoch, Loss=loss, Train=train_acc, Val=val_acc, Test=test_acc)
 
-
-# Print model's state_dict
-# print("Model's state_dict:")
-# for param_tensor in model.state_dict():
-#     print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+# # Print original and quantized weights
+# for key in model.state_dict():
+#     if "weight" in key:
+#         original_weight = model.state_dict()[key]
+#         quantized_weight = model_quant.state_dict()[key]
+#         print(f"Layer: {key}")
+#         print("Original Weight:")
+#         print(original_weight)
+#         print("Quantized Weight:")
+#         print(quantized_weight)
+#         print("=" * 30)
 
 torch.save({
     'model_state_dict': model.state_dict()
 }, "./checkpoints/gat.pth")
 
-# torch.save({
-#     'model_state_dict': model_quant.state_dict()
-# }, "./checkpoints/gat_quant.pth")
+torch.save({
+    'model_state_dict': model_quant.state_dict()
+}, "./checkpoints/gat_quant.pth")
 
 # start quantization
 # print("====== start quantization ======")
